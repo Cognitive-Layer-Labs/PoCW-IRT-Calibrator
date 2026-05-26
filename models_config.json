@@ -1,0 +1,98 @@
+{
+  "ollama_base_url": "http://localhost:11434",
+  "available_models": [
+    "tinyllama:1.1b",
+    "qwen2.5:1.5b",
+    "llama3.2:1b",
+    "smollm2:1.7b",
+    "gemma2:2b",
+    "phi3.5",
+    "qwen2.5:3b",
+    "llama3.2:3b",
+    "mistral:7b",
+    "qwen2.5:7b",
+    "llama3.1:8b",
+    "phi4-mini:3.8b"
+  ],
+  "validator_model": "qwen2.5:14b",
+  "model_details": [
+    {
+      "name": "tinyllama:1.1b",
+      "size_gb": 0.64,
+      "family": "llama",
+      "tier": 1
+    },
+    {
+      "name": "qwen2.5:1.5b",
+      "size_gb": 0.99,
+      "family": "qwen",
+      "tier": 1
+    },
+    {
+      "name": "llama3.2:1b",
+      "size_gb": 1.32,
+      "family": "llama",
+      "tier": 1
+    },
+    {
+      "name": "smollm2:1.7b",
+      "size_gb": 1.03,
+      "family": "smollm",
+      "tier": 1
+    },
+    {
+      "name": "gemma2:2b",
+      "size_gb": 1.63,
+      "family": "gemma",
+      "tier": 1
+    },
+    {
+      "name": "phi3.5",
+      "size_gb": 2.2,
+      "family": "phi",
+      "tier": 2
+    },
+    {
+      "name": "qwen2.5:3b",
+      "size_gb": 2.04,
+      "family": "qwen",
+      "tier": 2
+    },
+    {
+      "name": "llama3.2:3b",
+      "size_gb": 2.02,
+      "family": "llama",
+      "tier": 2
+    },
+    {
+      "name": "mistral:7b",
+      "size_gb": 4.1,
+      "family": "mistral",
+      "tier": 3
+    },
+    {
+      "name": "qwen2.5:7b",
+      "size_gb": 4.68,
+      "family": "qwen",
+      "tier": 3
+    },
+    {
+      "name": "llama3.1:8b",
+      "size_gb": 4.92,
+      "family": "llama",
+      "tier": 3
+    },
+    {
+      "name": "deepseek-r1:7b",
+      "size_gb": 4.7,
+      "family": "deepseek",
+      "tier": 3
+    },
+    {
+      "name": "phi4-mini:3.8b",
+      "size_gb": 2.5,
+      "family": "phi",
+      "tier": 3
+    }
+  ]
+}

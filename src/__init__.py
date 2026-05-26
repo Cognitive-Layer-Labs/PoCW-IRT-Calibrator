@@ -1,1 +1,0 @@
-"""IRT difficulty predictor package."""

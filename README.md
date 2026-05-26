@@ -1,219 +1,416 @@
-# IRT Difficulty Predictor (Question-Only, 2PL-Compatible API)
+# PoCW-IRT-Calibrator
 
-This project trains a local ML model that predicts IRT item difficulty (`b`) from question text only.
-The inference API is 2PL-compatible by returning both parameters:
+Calibrează automat parametrii **IRT** (Item Response Theory) pentru întrebări de tip multiple-choice, true/false și open-ended, folosind răspunsurile unor modele LLM mici ca „examinatori sintetici". Rezultatul este un set de regresorii XGBoost care prezic parametrii IRT și statistici empirice direct din textul întrebării.
 
-- `b`: predicted difficulty
-- `a`: fixed to `1.0` for now
+---
 
-That means the model behaves like 1PL/Rasch today, while keeping a stable interface for future 2PL calibration.
+## Cuprins
 
-## Required Libraries
+- [Cum funcționează](#cum-funcționează)
+- [Dataset](#dataset)
+- [Modele Ollama](#modele-ollama)
+- [IRT — modele suportate](#irt--modele-suportate)
+- [Procesul de training](#procesul-de-training)
+- [Performanță curentă](#performanță-curentă)
+- [Limitări cunoscute și îmbunătățiri](#limitări-cunoscute-și-îmbunătățiri)
+- [Input / Output](#input--output)
+- [Setup](#setup)
+- [Rulare](#rulare)
+- [CLI — opțiuni complete](#cli--opțiuni-complete)
+- [Artefacte generate](#artefacte-generate)
 
-The project uses:
+---
 
-- `datasets`
-- `pandas`, `numpy`
-- `scikit-learn`
-- `textstat`
-- `nltk`
-- `spacy`
-- `matplotlib`, `seaborn`
-- `joblib`
-- `transformers` (included per requested environment/tooling)
-- `tqdm`
+## Cum funcționează
 
-All are listed in `requirements.txt`.
-
-## Local Setup (macOS / Python 3.11+)
-
-Use any available Python interpreter that is 3.11 or newer.
-
-```bash
-python3 -V
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-pip install -r requirements.txt
+```
+Întrebări (MMLU + BoolQ + TriviaQA)
+           │
+           ▼
+┌──────────────────────┐
+│  Etapa 1             │  Descarcă și amestecă cele 3 surse de pe HuggingFace
+│  Load dataset        │  → 11 270 întrebări (MC + TF + open-ended)
+└─────────┬────────────┘
+          │
+          ▼
+┌──────────────────────┐
+│  Etapa 2             │  12 modele Ollama răspund la fiecare întrebare
+│  Response matrix     │  async, greedy (temp=0, top_k=1)
+│                      │  Open-ended: validat de qwen2.5:14b (model extern)
+│                      │  → matrice binară (12 modele × 11 270 întrebări)
+│                      │  Checkpointing per model — se poate opri și relua
+└─────────┬────────────┘
+          │
+          ▼
+┌──────────────────────┐
+│  Etapa 3             │  py-irt (Pyro/PyTorch) fittează IRT pe response matrix
+│  Fit IRT             │  Suportă 1PL / 2PL / 4PL
+│                      │  Fallback automat: MLE scipy (2PL per item)
+│                      │  → irt_params.json (a, b, [c, d] per întrebare)
+└─────────┬────────────┘
+          │
+          ▼
+┌──────────────────────┐
+│  Etapa 4             │  BAAI/bge-small-en-v1.5 (384 dim, rulat pe MPS)
+│  Embed întrebări     │  text = "[subject] întrebare A) ... B) ..."
+│                      │  → embeddings.npy (11 270, 384)
+└─────────┬────────────┘
+          │
+          ▼
+┌──────────────────────┐
+│  Etapa 5             │  XGBoost per parametru: embedding (384d) +
+│  Train regresorii    │  10 features text → a, b, c, d (IRT)
+│                      │            → p_correct, item_discrimination (empirice)
+│                      │  Evaluare: 5-fold CV (OOF); model final pe tot setul
+└─────────┬────────────┘
+          │
+          ▼
+┌──────────────────────┐
+│  Etapa 6 + 7         │  irt_predictor.py — API standalone
+│  Export + Plots      │  training_dataset.parquet / .csv
+│                      │  plots/ — acuratețe, distribuții IRT, metrici CV
+└──────────────────────┘
 ```
 
-If `python3` is not found, install Python first:
+---
 
-```bash
-brew install python
+## Dataset
+
+Trei surse descărcate automat de pe HuggingFace la prima rulare (**fără API key**). Cache local în `~/.cache/huggingface/`.
+
+| Sursă | HuggingFace ID | Tip | Rows efective | Dimensiune |
+|---|---|---|---|---|
+| [MMLU](https://huggingface.co/datasets/cais/mmlu) | `cais/mmlu` | MC 4 variante | 4 000 | ~50 MB |
+| [BoolQ](https://huggingface.co/datasets/google/boolq) | `google/boolq` | True / False | 3 270 (cap) | ~5 MB |
+| [TriviaQA](https://huggingface.co/datasets/trivia_qa) | `trivia_qa rc.nocontext` | Open-ended | 4 000 | ~80 MB |
+
+`--questions N` distribuie egal între surse (N/3 fiecare). BoolQ are cap la 3 270:
+
+```
+--questions 900    →  mmlu=300,  boolq=300,  triviaqa=300   →  900 efective
+--questions 12000  →  mmlu=4000, boolq=3270, triviaqa=4000  →  11 270 efective
 ```
 
-If you specifically want Python 3.11:
+### Formate de prompt
 
-```bash
-brew install python@3.11
-/opt/homebrew/opt/python@3.11/bin/python3.11 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-pip install -r requirements.txt
+```
+# MC (MMLU)
+Q: What is the chemical formula for water?
+A) CO2   B) H2O   C) NaCl   D) O2
+Answer with only the letter (A/B/C/D):
+
+# True/False (BoolQ)
+Q: Is the Eiffel Tower located in Paris?
+A) True   B) False
+Answer with only the letter (A/B):
+
+# Open-ended (TriviaQA)
+Q: What is the capital of Australia?
+Answer briefly in 1-2 sentences:
 ```
 
-Download NLP assets once:
+---
 
-```bash
-python -m nltk.downloader punkt punkt_tab averaged_perceptron_tagger stopwords wordnet omw-1.4
-python -m spacy download en_core_web_sm
-```
+## Modele Ollama
 
-## Training
+Modelele joacă rolul de **„examinatori sintetici"** — răspunsurile lor colective permit estimarea dificultății și discriminabilității prin IRT. Diversitatea arhitecturală este esențială: modele din familii diferite fac greșeli diferite, ceea ce stabilizează estimările IRT.
 
-The CLI is intentionally minimal.
+### Tier 1 — Must-have (~5.6 GB total)
 
-Core command (recommended):
+| Model | Familie | Dim | Acuratețe (run curent) |
+|---|---|---|---|
+| [tinyllama:1.1b](https://ollama.com/library/tinyllama) | LLaMA | 0.6 GB | 34.8% |
+| [qwen2.5:1.5b](https://ollama.com/library/qwen2.5) | Qwen | 1.0 GB | 53.9% |
+| [llama3.2:1b](https://ollama.com/library/llama3.2) | LLaMA | 1.3 GB | 45.0% |
+| [smollm2:1.7b](https://ollama.com/library/smollm2) | SmolLM | 1.0 GB | 50.5% |
+| [gemma2:2b](https://ollama.com/library/gemma2) | Gemma | 1.6 GB | 58.5% |
 
-```bash
-python train_pipeline.py --data-path data/cross_difficulty_train.csv
-```
+### Tier 2 — Recomandat (~6.2 GB total)
 
-Optional:
+| Model | Familie | Dim | Acuratețe (run curent) |
+|---|---|---|---|
+| [phi3.5](https://ollama.com/library/phi3.5) | Phi | 2.2 GB | 58.3% |
+| [qwen2.5:3b](https://ollama.com/library/qwen2.5) | Qwen | 2.0 GB | 55.6% |
+| [llama3.2:3b](https://ollama.com/library/llama3.2) | LLaMA | 2.0 GB | 58.7% |
 
-- `--verbose` for detailed logs
+### Tier 3 — Opțional (~16.2 GB total)
 
-Examples:
+| Model | Familie | Dim | Acuratețe (run curent) |
+|---|---|---|---|
+| [mistral:7b](https://ollama.com/library/mistral) | Mistral | 4.1 GB | 63.9% |
+| [qwen2.5:7b](https://ollama.com/library/qwen2.5) | Qwen | 4.7 GB | 65.0% |
+| [llama3.1:8b](https://ollama.com/library/llama3.1) | LLaMA | 4.9 GB | 63.5% |
+| [phi4-mini:3.8b](https://ollama.com/library/phi4-mini) | Phi | 2.5 GB | 59.4% |
 
-```bash
-python train_pipeline.py --data-path data/cross_difficulty_train.csv --verbose
-```
+> **Notă validator:** `qwen2.5:14b` (~8.2 GB) este folosit **exclusiv ca validator** pentru open-ended și **nu** intră în matricea de răspunsuri. Poate fi înlocuit în `models_config.json` cu `gemma2:9b` sau `phi4:14b`.
 
-The trainer now runs in **max-power mode by default** (largest candidate set).
-No profile flag is required.
+> **Minimum recomandat pentru IRT stabil:** cel puțin 8 modele din Tier 1+2+3. Sub 5 modele, parametrul `a` devine instabil. Sub 10 modele cu 4PL, parametrul `b` suferă de shrinkage Bayesian sever (vezi [Limitări](#limitări-cunoscute-și-îmbunătățiri)).
 
-What happens by default:
+> **Modele de tip reasoning** (deepseek-r1, qwq, :thinking): generate blocuri `<think>` lungi care depășesc frecvent limita de tokeni și cauzează erori de parsing (~23%). Nu sunt recomandate ca examinatori.
 
-- The trainer tests multiple candidate pipelines automatically (linguistic, embedding, hybrid).
-- In `max` profile it also evaluates strong transformer embeddings (`all-mpnet-base-v2`, `bge-base-en-v1.5`) if dependencies are installed.
-- It winsorizes extreme target values before training (outlier-robust target).
-- It evaluates each with cross-validation.
-- It keeps and saves the **best** model automatically based on held-out performance:
-  highest **domain-aware** `acc_within_2.5` (fallback `acc_within_2`), then lowest domain-aware `test_mae`.
-- It applies isotonic calibration when calibration helps on OOF predictions.
-- It also fits per-domain models (when enough samples exist) and enables per-domain calibrators only if they improve held-out objective, with global fallback at inference.
-- It computes a weighted blend of top models for comparison (`blend_result` in metrics).
-- Full logs go to `reports/train.log`.
+---
 
-Important: to enable transformer candidates you must install PyTorch:
+## IRT — modele suportate
 
-```bash
-pip install -r requirements.txt
-```
+| Model | Params per item | Ecuație | Când să folosești |
+|---|---|---|---|
+| **1PL** (Rasch) | 1 (`b`) | `P = 1/(1+exp(-(θ-b)))` | Puțini examinatori (<5), consistență maximă |
+| **2PL** | 2 (`a`, `b`) | `P = 1/(1+exp(-a(θ-b)))` | Recomandat cu 8-15 examinatori |
+| **4PL** | 4 (`a`, `b`, `c`, `d`) | `P = c + (d-c)/(1+exp(-a(θ-b)))` | Necesită >15 examinatori pentru stabilitate |
 
-Expected columns in local data:
+Configurabil cu `--irt-model 1pl|2pl|4pl`. Default curent: `4pl` (poate fi schimbat în `CFG["irt_model"]`).
 
-- `question`
-- `irt_difficulty`
+**Statistici empirice** (adăugate automat, independent de modelul IRT):
 
-If `--data-path` is missing, the script attempts HF fallback. If HF access is gated,
-set `HF_TOKEN` or keep using local file mode.
+| Statistică | Formulă | Avantaj față de IRT |
+|---|---|---|
+| `p_correct` | `mean(coloană din response matrix)` | Fără shrinkage Bayesian; mai predictibil din text |
+| `item_discrimination` | Corelație punct-biserială item vs. scor-rest | Mai stabil decât `a` cu puțini examinatori |
 
-## What the Pipeline Does
+---
 
-1. Loads either:
-   - Hugging Face dataset `BatsResearch/Cross-Difficulty` (train split), or
-   - a local file/folder from `--data-path`.
-2. Uses only `question` text (no answer choices) and `irt_difficulty`.
-3. Winsorizes extreme target values to reduce outlier sensitivity.
-4. Trains multiple candidate pipelines (linguistic, embedding, hybrid) with tuned regressors (`RF`, `ExtraTrees`, `Ridge`, `HGB`, `MLP`, optional `XGBoost`).
-5. Selects the best candidate automatically using domain-aware held-out tolerance + MAE objective.
-6. Fits isotonic calibration and evaluates calibrated predictions.
-7. Trains per-domain models using the best feature space and keeps global fallback.
-8. Evaluates on test set (MSE, MAE, R2), including domain-aware fallback metrics.
-9. Saves model bundle + feature names + metrics + diagnostic plots.
+## Procesul de training
 
-## Output Artifacts
+### Etapa 2: Response matrix
 
-After training, you should get:
+Fiecare model răspunde greedy (`temperature=0`, `top_k=1`) via [Ollama API](https://github.com/ollama/ollama), async cu 12 cereri paralele.
 
-- `artifacts/difficulty_predictor.pkl`
-- `artifacts/feature_names.json`
-- `reports/metrics.json`
-- `reports/model_leaderboard.csv`
-- `reports/test_predictions.csv`
-- `reports/figures/cv_results.png`
-- `reports/figures/pred_vs_actual.png`
-- `reports/figures/feature_importance.png`
-- `reports/figures/learning_curve.png`
-- `reports/figures/residuals.png`
+- **MC / TF:** prima literă validă din răspuns, comparată cu răspunsul corect → `1/0`
+- **Open-ended:** modelul răspunde liber (max 80 tokeni), `qwen2.5:14b` validează cu `yes/no`; alias-urile exacte (ex. "canberra" în răspuns) scurtcircuitează apelul LLM
 
-## Plot Interpretation
+Checkpointing per model în `irt_checkpoints/{run_id}/responses_{model}.json` — procesul poate fi oprit și reluat cu `--resume`.
 
-- `cv_results.png`: compares CV train/test MSE across sampled hyperparameter configurations.
-  - Useful for seeing if some configurations overfit (large train-test gap).
-- `pred_vs_actual.png`: predicted vs real `b` values on test set.
-  - Closer to the diagonal line means better calibration quality.
-- `feature_importance.png`: top feature importances/weights of the selected best model.
-  - Shows which features contributed most to `b` prediction.
-- `learning_curve.png`: training and validation MSE vs training set size.
-  - Indicates whether more data may improve generalization.
+### Etapa 3: IRT fitting
 
-For exact numbers and top ranked features, check `reports/metrics.json`.
+[py-irt](https://github.com/nd-ball/py-irt) (Pyro + PyTorch) fittează modelul IRT pe toată matricea simultan (NUTS sau SVI, 3000 epoch-uri). Dacă py-irt eșuează (timeout, eroare de convergență), fallback automat la MLE scipy (L-BFGS-B per item, 2PL).
 
-`reports/test_predictions.csv` includes both:
-- `predicted_b_global` (single global model path)
-- `predicted_b_domain_aware` (domain override + fallback path)
+### Etapa 5: XGBoost cu 5-fold CV
 
-### Meaning of `acc_within_X`
+Input: embeddings (384d) + 10 features din text (lungime întrebare, număr cuvinte, total caractere răspunsuri, prezența negațiilor și a cuvintelor interogative).
 
-`acc_within_X` = percent of questions where:
+Pentru fiecare parametru (`a`, `b`, `c`, `d`, `p_correct`, `item_discrimination`):
+1. **5-fold CV** pentru evaluare (OOF predictions → RMSE, R², % în margine 20%)
+2. **Model final antrenat pe tot setul** — acesta este salvat pentru inferență
 
-`|predicted_b - true_b| <= X`
+---
 
-Examples:
+## Performanță curentă
 
-- `acc_within_0.5 = 0.30` means 30% of predictions are within +/-0.5 logits.
-- `acc_within_2.0 = 0.80` means 80% are within +/-2 logits.
+Run: `20260525_2339` — 11 270 întrebări × 12 modele, 4PL IRT, bge-small-en-v1.5 embeddings.
 
-## Inference Usage
+| Parametru | Semnificație | CV RMSE | CV R² | În margine 20% |
+|---|---|---|---|---|
+| `a` (discrimination) | Discriminabilitate IRT | 0.324 | 0.063 | **90.7%** ✓ |
+| `b` (difficulty) | Dificultate IRT (logit) | 2.708 | 0.086 | 39.6% |
+| `c` (guessing) | Lower asymptote | 0.008 | 0.998 | **99.9%** ✓ |
+| `d` (upper asymptote) | Upper asymptote | 0.205 | 0.096 | 27.9% |
+| `p_correct` | Dificultate empirică [0,1] | 0.264 | 0.229 | 52.8% |
+| `item_discrimination` | Discriminare empirică [-1,1] | 0.368 | 0.116 | 62.9% |
+
+**Notă margine 20%:** pragul este `0.20 × (max - min)` per parametru (ex. `b` cu range=8 → prag ±1.6; `p_correct` cu range=1 → prag ±0.20).
+
+---
+
+## Limitări cunoscute și îmbunătățiri
+
+### Shrinkage Bayesian pe `b` și `d`
+
+Cu 12 modele mici (35–65% acuratețe) și modelul 4PL, py-irt aplică un prior Bayesian puternic care **comprimă** toți parametrii spre medie. Efectul vizibil: `b` are R²=0.086 (practic nepredicibil din text), iar `d` are R²=0.095.
+
+**Soluții în ordinea costului:**
+
+| Soluție | Cost | Câștig estimat pe `b` |
+|---|---|---|
+| Schimbă la 2PL (`--irt-model 2pl`) | Re-run etapa 3 (~45 min) | Moderat — mai puțini parametri, mai puțin shrinkage |
+| Embeddings mai mari (bge-large, 1024d) | Re-run etapa 4 (~15 min) | ~20–30% RMSE reduction |
+| Adaugă modele 14B+ (phi4:14b, qwen2.5:32b) | Download + full re-inference (~12h) | Mare — estimări IRT mai stabile |
+| Toate combinat | ~14h total | Potențial 60–75% within 20% pentru `b` |
+
+### `p_correct` vs. IRT `b` ca proxy de dificultate
+
+`p_correct` (media coloanei din response matrix) este **mai predictibil** din text (R²=0.229 vs. 0.086) deoarece nu suferă de shrinkage Bayesian. Dacă scopul este să estimezi dificultatea relativă a întrebărilor, `p_correct` este recomandată ca target primar.
+
+### deepseek-r1 și modele de tip reasoning
+
+deepseek-r1:7b generează blocuri `<think>...</think>` care depășesc frecvent 1024 tokeni (~23% erori de parsing) și nu poate fi folosit ca examinator fiabil. Exclude-le prin `reasoning_model_patterns` în CFG sau prin `models_config.json`.
+
+---
+
+## Input / Output
+
+### Inferență cu predictor standalone
+
+Artefactele din `irt_runs/{run_id}/` sunt portabile. Copiază directorul și importă:
 
 ```python
-from src.predictor import load_predictor
+import sys
+sys.path.insert(0, "irt_runs/20260525_2339_12000q_12m_4pl_mmlu-boolq-triviaqa")
+from irt_predictor import IRTPredictor
 
-predictor = load_predictor("artifacts/difficulty_predictor.pkl")
-params = predictor.predict_item_params("What is the capital of France?")
-print(params)  # {'b': 0.23, 'a': 1.0}
+p = IRTPredictor()
 
-# Optional: provide domain if available (falls back to global if missing)
-params_domain = predictor.predict_item_params("What is the capital of France?", domain="arc")
-print(params_domain)
-
-# Optional: provide Bloom level (1-6 or text like "analyze")
-params_bloom = predictor.predict_item_params(
-    "What is the capital of France?",
-    domain="arc",
-    bloom_level=2
+result = p.predict(
+    question="Which of the following best describes osmosis?",
+    choices=[
+        "Movement of solutes from high to low concentration",
+        "Movement of water across a semipermeable membrane",
+        "Active transport requiring ATP",
+        "Diffusion of gases in the lungs",
+    ]
 )
-print(params_bloom)
 ```
 
-CLI example:
+### Output
+
+```python
+{
+    "a":                   1.43,    # discrimination IRT
+    "b":                   0.21,    # difficulty IRT (logit, scala ~[-3, 3])
+    "c":                   0.25,    # guessing (lower asymptote)
+    "d":                   0.97,    # upper asymptote
+    "p_correct":           0.61,    # dificultate empirică [0=greu, 1=ușor]
+    "item_discrimination": 0.48,    # corelație punct-biserială [-1, 1]
+    "difficulty":          "medie", # etichetă semantică pentru b
+    "discrimination":      "bun discriminativă",
+}
+```
+
+### Etichete semantice
+
+| `b` | Dificultate |
+|---|---|
+| `b < -1.5` | Foarte ușoară |
+| `-1.5 ≤ b < -0.5` | Ușoară |
+| `-0.5 ≤ b < 0.5` | Medie |
+| `0.5 ≤ b < 1.5` | Grea |
+| `b ≥ 1.5` | Foarte grea |
+
+| `a` | Discriminare |
+|---|---|
+| `a < 0.5` | Slab discriminativă |
+| `0.5 ≤ a < 1.0` | Moderat discriminativă |
+| `1.0 ≤ a < 2.0` | Bun discriminativă |
+| `a ≥ 2.0` | Excelent discriminativă |
+
+---
+
+## Setup
 
 ```bash
-python example_inference.py --question "Explain how photosynthesis converts light into chemical energy."
+git clone <repo-url>
+cd PoCW-IRT-Calibrator
+
+# py-irt necesită Python <3.12
+/opt/homebrew/bin/python3.10 -m venv .venv
+source .venv/bin/activate
+
+pip install -r requirements.txt
+
+# macOS: OpenMP pentru XGBoost
+brew install libomp
+
+# Pornește Ollama (trebuie să ruleze în fundal)
+ollama serve
 ```
 
-## Fine-tune a Transformer Regressor
-
-Use this when you want a dedicated regression head on top of a transformer:
+### Descarcă modelele
 
 ```bash
-python finetune_transformer_regressor.py \
-  --data-path data/cross_difficulty_train.csv \
-  --model-name sentence-transformers/all-mpnet-base-v2 \
-  --output-dir artifacts/finetuned-transformer-regressor \
-  --epochs 3 \
-  --batch-size 16
+# Verifică ce e instalat deja
+python3 download_models.py --check
+
+# Tier 1 — minim viabil (~5.6 GB)
+python3 download_models.py --fast
+
+# Tier 1+2 — recomandat (~11.8 GB)
+python3 download_models.py --tier 2
+
+# Tier 1+2+3 — complet (~28 GB)
+python3 download_models.py --tier 3
+
+# Test funcțional după download
+python3 download_models.py --verify
 ```
 
-This saves:
+---
 
-- fine-tuned checkpoint in `artifacts/finetuned-transformer-regressor`
-- encoder-only export in `artifacts/finetuned-transformer-regressor/encoder`
-- metrics in `artifacts/finetuned-transformer-regressor/finetune_metrics.json`
+## Rulare
 
-You can then point embedding candidates to the exported encoder path by replacing
-`embedding_model` in candidate configs if desired.
+```bash
+source .venv/bin/activate
 
+# Test rapid cu 5 modele Tier 1 (~3-4 ore)
+python3 train_irt_predictor.py --questions 300 --irt-model 2pl --fast
+
+# Rulare standard — 12 modele, ~11 270 întrebări (~11-14 ore)
+python3 train_irt_predictor.py --irt-model 4pl
+
+# Reia de unde s-a oprit (checkpointing per model)
+python3 train_irt_predictor.py --resume
+
+# Re-rulează doar etapa 5 (regresorii) cu date existente
+python3 train_irt_predictor.py --resume --skip-stage 1 --skip-stage 2 --skip-stage 3 --skip-stage 4
+
+# Re-rulează etapele 4+5 (reembedding + regresorii) cu response matrix existentă
+python3 train_irt_predictor.py --resume --skip-stage 1 --skip-stage 2 --skip-stage 3
+```
+
+### Durate estimate (M4 Max, 36 GB RAM)
+
+| Etapă | ~11 270 întrebări × 12 modele | `--fast` (5 modele) |
+|---|---|---|
+| Download datasets (prima dată) | ~5 min | ~5 min |
+| Response matrix MC/TF | ~7–9 ore | ~2–3 ore |
+| Validare open-ended (qwen2.5:14b) | ~2–3 ore | ~1 oră |
+| IRT fitting (py-irt, 3000 epoch-uri) | ~15 min | ~10 min |
+| Embedding + XGBoost (5-fold CV) | ~10 min | ~5 min |
+| **Total** | **~11–14 ore** | **~3–4 ore** |
+
+---
+
+## CLI — opțiuni complete
+
+```
+python3 train_irt_predictor.py [opțiuni]
+
+  --questions N         Număr total de întrebări (default: 12000; efective: 11270)
+  --irt-model MODEL     Modelul IRT: 1pl, 2pl, 4pl (default: 4pl)
+  --fast                Limitează la 5 modele Tier 1 (tinyllama, qwen2.5:1.5b,
+                        llama3.2:1b, smollm2:1.7b, gemma2:2b)
+  --resume              Reia din cel mai recent run (matching checkpoints)
+  --skip-stage N        Sare etapa N (1-5); poate fi repetat
+                        ex: --skip-stage 2 --skip-stage 3
+```
+
+`--resume` caută automat în `irt_checkpoints/` după un run cu același număr de modele, model IRT și datasets, și reia din checkpointurile existente.
+
+---
+
+## Artefacte generate
+
+```
+irt_runs/{timestamp}_{N}q_{M}m_{irt}_{datasets}/
+├── response_matrix.npy       ← (M modele × N întrebări) binară
+├── embeddings.npy            ← (N, 384) float32
+├── irt/
+│   ├── irt_params.json       ← arrays a, b, [c, d] per întrebare
+│   └── responses.jsonlines   ← input brut pentru py-irt
+├── xgb_regressors.pkl        ← 6 regresorii XGBoost serializați
+├── irt_predictor.py          ← predictor standalone (copiabil)
+├── training_dataset.parquet  ← N întrebări + toți parametrii IRT + empirici
+├── training_dataset.csv      ← același dataset în format CSV
+├── metrics.json              ← CV RMSE, R², within_20pct_margin per param
+├── training_config.json      ← config complet + timestamp + acuratețe modele
+├── training.log              ← log complet al run-ului
+└── plots/
+    ├── accuracy_per_model.png
+    ├── irt_distributions.png
+    ├── xgb_metrics.png
+    └── response_matrix_heatmap.png
+
+irt_checkpoints/{timestamp}_{N}q_{M}m_{irt}_{datasets}/
+├── questions.json                    ← întrebările (evită re-descărcarea)
+└── responses_{model}.json            ← răspunsurile per model (12 fișiere)
+```
+
+Numele run-ului (`{timestamp}_{N}q_{M}m_{irt}_{datasets}`) identifică unic configurația și permite `--resume` să găsească checkpointurile corecte.
