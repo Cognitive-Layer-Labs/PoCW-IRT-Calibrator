@@ -1,5 +1,9 @@
 # PoCW-IRT-Calibrator
 
+**Model releases and metrics:** [RELEASES.md](RELEASES.md) — 2PL vs 4PL comparison with RMSE / R² / within-margin rates for all parameters.
+
+---
+
 Calibrează automat parametrii **IRT** (Item Response Theory) pentru întrebări de tip multiple-choice, true/false și open-ended, folosind răspunsurile unor modele LLM mici ca „examinatori sintetici". Rezultatul este un set de regresorii XGBoost care prezic parametrii IRT și statistici empirice direct din textul întrebării.
 
 ---

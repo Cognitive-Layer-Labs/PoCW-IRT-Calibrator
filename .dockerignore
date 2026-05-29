@@ -1,0 +1,13 @@
+__pycache__
+*.pyc
+*.pyo
+*.npy
+*.parquet
+*.csv
+*.log
+*.pkl
+irt_runs/
+irt_checkpoints/
+path/
+models_config.json
+plots/
